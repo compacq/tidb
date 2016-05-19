@@ -16,6 +16,7 @@ package executor
 import (
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,13 +49,7 @@ var (
 // XExecutor defines some interfaces used by dist-sql.
 type XExecutor interface {
 	// AddAggregate adds aggregate info into an executor.
-	AddAggregate()
-}
-
-// aggregateInfo is used for coprocessor executing aggregate layer.
-type aggregateInfo struct {
-	aggFuncs     []*ast.AggregateFuncExpr
-	groupByItems []*ast.ByItem
+	AddAggregate(funcs []*tipb.Expr, byItems []*tipb.Expr)
 }
 
 // XSelectTableExec represents XAPI select executor.
@@ -68,7 +63,13 @@ type XSelectTableExec struct {
 	subResult        *xapi.SubResult
 	supportDesc      bool
 	allFiltersPushed bool
-	aggregate        *aggregateInfo
+	aggFuncs         []*tipb.Expr
+	byItems          []*tipb.Expr
+}
+
+func (e *XSelectTableExec) AddAggregate(funcs []*tipb.Expr, byItems []*tipb.Expr) {
+	e.aggFuncs = funcs
+	e.byItems = byItems
 }
 
 // Next implements Executor Next interface.
@@ -180,7 +181,8 @@ type XSelectIndexExec struct {
 	ctx         context.Context
 	where       *tipb.Expr
 	supportDesc bool
-	aggregate   *aggregateInfo
+	aggFuncs    []*tipb.Expr
+	byItems     []*tipb.Expr
 
 	tasks      []*lookupTableTask
 	taskCursor int
@@ -208,6 +210,11 @@ type lookupTableTask struct {
 	status  int
 	done    bool
 	doneCh  chan error
+}
+
+func (e *XSelectIndexExec) AddAggregate(funcs []*tipb.Expr, byItems []*tipb.Expr) {
+	e.aggFuncs = funcs
+	e.byItems = byItems
 }
 
 // Fields implements Executor Fields interface.
@@ -697,13 +704,53 @@ func (b *executorBuilder) exprToPBExpr(client kv.Client, expr ast.ExprNode, tn *
 		return b.subqueryToPBExpr(client, x)
 	case *ast.AggregateFuncExpr:
 		return b.aggFuncToPBExpr(client, x)
+	case *ast.ByItem:
+		return b.byItemToPBExpr(client, x)
 	default:
 		return nil
 	}
 }
 
-func (b *executorBuilder) aggFuncToPBExpr(client kv.Client, aggFunc *ast.AggregateFuncExpr) *tipb.Expr {
-	return nil
+func (b *executorBuilder) groupByItemToPBExpr(client kv.Client, item *ast.ByItem) *tipb.Expr {
+	expr := b.exprToPBExpr(client, item.Expr)
+	if expr == nil {
+		return nil
+	}
+	return &tipb.ByItem{Expr: expr}
+}
+
+func (b *executorBuilder) aggFuncToPBExpr(client kv.Client, af *ast.AggregateFuncExpr) *tipb.Expr {
+	name := strings.ToLower(af.Name)
+	var tp int64
+	switch name {
+	case AggFuncCount:
+		tp = int64(tipb.ExprType_Count)
+	case AggFuncFirstRow:
+		tp = int64(tipb.ExprType_First)
+	case AggFuncGroupConcat:
+		tp = int64(tipb.ExprType_GroupConcat)
+	case AggFuncMax:
+		tp = int64(tipb.ExprType_Max)
+	case AggFuncMin:
+		tp = int64(tipb.ExprType_Min)
+	case AggFuncSum:
+		tp = int64(tipb.ExprType_Sum)
+	case AggFuncAvg:
+		tp = int64(tipb.ExprType_Avg)
+	}
+	if !client.SupportRequestType(kv.ReqTypeSelect, tp) {
+		return nil
+	}
+	// convert it to pb
+	children := make([]*tipb.Expr, 0, len(af.Args))
+	for _, arg := range af.Args {
+		pbArg := b.exprToPBExpr(client, arg)
+		if pdArg == nil {
+			return nil
+		}
+		children = append(children, pbArg)
+	}
+	return &tipb.Expr{Tp: tp.Enum(), Children: children}
 }
 
 func (b *executorBuilder) columnNameToPBExpr(client kv.Client, column *ast.ColumnNameExpr, tn *ast.TableName) *tipb.Expr {

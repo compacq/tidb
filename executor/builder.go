@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/autocommit"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 // executorBuilder builds an Executor from a Plan.
@@ -418,22 +419,43 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 	if !ok {
 		return e
 	}
+	txn, err := b.ctx.GetTxn(false)
+	if err != nil {
+		b.err = err
+		return nil
+	}
 	client := txn.GetClient()
 	if !client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeAgg) {
 		return e
 	}
-	if v.GroupByItems != nil && !client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeGroupby) {
+	if len(v.GroupByItems) > 0 && !client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeGroupBy) {
 		return e
 	}
+	// Convert aggregate function exprs to pb.
+	pbAggFuncs := make([]*tipb.Expr, 0, len(v.AggFuncs))
 	for _, af := range v.AggFuncs {
+		if af.Distinct {
+			// We do not support distinct push down.
+			return e
+		}
 		pbAggFunc := b.aggFuncToPBExpr(client, af)
 		if pbAggFunc == nil {
 			return e
 		}
+		pbAggFuncs = append(pbAggFuncs, pbAggFunc)
+	}
+	pbByItems := make([]*tipb.Expr, 0, len(v.GroupByItems))
+	// Convert groupby to pb
+	for _, item := range v.GroupByItems {
+		pbByItem := b.groupByItemToPBExpr(client, item)
+		if pbByItem == nil {
+			return e
+		}
+		pbByItems = append(pbByItems, pbByItem)
 	}
 	// compose aggregate info
-	xSrc.AddAggregate()
-	return xSrc
+	xSrc.AddAggregate(pbAggFuncs, pbByItems)
+	return src
 }
 
 func (b *executorBuilder) buildHaving(v *plan.Having) Executor {
