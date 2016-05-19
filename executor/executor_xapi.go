@@ -38,8 +38,28 @@ import (
 	"github.com/pingcap/tipb/go-tipb"
 )
 
+var (
+	_ Executor  = &XSelectTableExec{}
+	_ Executor  = &XSelectIndexExec{}
+	_ XExecutor = &XSelectTableExec{}
+	_ XExecutor = &XSelectIndexExec{}
+)
+
+// XExecutor defines some interfaces used by dist-sql.
+type XExecutor interface {
+	// AddAggregate adds aggregate info into an executor.
+	AddAggregate()
+}
+
+// aggregateInfo is used for coprocessor executing aggregate layer.
+type aggregateInfo struct {
+	aggFuncs     []*ast.AggregateFuncExpr
+	groupByItems []*ast.ByItem
+}
+
 // XSelectTableExec represents XAPI select executor.
 type XSelectTableExec struct {
+	XExecutor
 	table            table.Table
 	tablePlan        *plan.TableScan
 	where            *tipb.Expr
@@ -48,6 +68,7 @@ type XSelectTableExec struct {
 	subResult        *xapi.SubResult
 	supportDesc      bool
 	allFiltersPushed bool
+	aggregate        *aggregateInfo
 }
 
 // Next implements Executor Next interface.
@@ -153,11 +174,13 @@ func (e *XSelectTableExec) doRequest() error {
 
 // XSelectIndexExec represents XAPI select index executor.
 type XSelectIndexExec struct {
+	XExecutor
 	table       table.Table
 	indexPlan   *plan.IndexScan
 	ctx         context.Context
 	where       *tipb.Expr
 	supportDesc bool
+	aggregate   *aggregateInfo
 
 	tasks      []*lookupTableTask
 	taskCursor int
@@ -672,9 +695,15 @@ func (b *executorBuilder) exprToPBExpr(client kv.Client, expr ast.ExprNode, tn *
 		return b.patternInToPBExpr(client, x, tn)
 	case *ast.SubqueryExpr:
 		return b.subqueryToPBExpr(client, x)
+	case *ast.AggregateFuncExpr:
+		return b.aggFuncToPBExpr(client, x)
 	default:
 		return nil
 	}
+}
+
+func (b *executorBuilder) aggFuncToPBExpr(client kv.Client, aggFunc *ast.AggregateFuncExpr) *tipb.Expr {
+	return nil
 }
 
 func (b *executorBuilder) columnNameToPBExpr(client kv.Client, column *ast.ColumnNameExpr, tn *ast.TableName) *tipb.Expr {

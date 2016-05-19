@@ -414,7 +414,26 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 		AggFuncs:     v.AggFuncs,
 		GroupByItems: v.GroupByItems,
 	}
-	return e
+	xSrc, ok := src.(XExecutor)
+	if !ok {
+		return e
+	}
+	client := txn.GetClient()
+	if !client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeAgg) {
+		return e
+	}
+	if v.GroupByItems != nil && !client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeGroupby) {
+		return e
+	}
+	for _, af := range v.AggFuncs {
+		pbAggFunc := b.aggFuncToPBExpr(client, af)
+		if pbAggFunc == nil {
+			return e
+		}
+	}
+	// compose aggregate info
+	xSrc.AddAggregate()
+	return xSrc
 }
 
 func (b *executorBuilder) buildHaving(v *plan.Having) Executor {
