@@ -438,21 +438,22 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 			// We do not support distinct push down.
 			return e
 		}
-		pbAggFunc := b.aggFuncToPBExpr(client, af)
+		pbAggFunc := b.aggFuncToPBExpr(client, af, xSrc.GetTableName())
 		if pbAggFunc == nil {
 			return e
 		}
 		pbAggFuncs = append(pbAggFuncs, pbAggFunc)
 	}
-	pbByItems := make([]*tipb.Expr, 0, len(v.GroupByItems))
+	pbByItems := make([]*tipb.ByItem, 0, len(v.GroupByItems))
 	// Convert groupby to pb
 	for _, item := range v.GroupByItems {
-		pbByItem := b.groupByItemToPBExpr(client, item)
+		pbByItem := b.groupByItemToPB(client, item, xSrc.GetTableName())
 		if pbByItem == nil {
 			return e
 		}
 		pbByItems = append(pbByItems, pbByItem)
 	}
+	fmt.Println("Enable Agg")
 	// compose aggregate info
 	xSrc.AddAggregate(pbAggFuncs, pbByItems)
 	return src
