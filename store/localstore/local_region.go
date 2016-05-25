@@ -6,6 +6,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
+	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
@@ -45,6 +46,7 @@ type selectContext struct {
 	txn          kv.Transaction
 	eval         *xeval.Evaluator
 	whereColumns map[int64]*tipb.ColumnInfo
+	aggregates   []*aggregateFuncExpr
 }
 
 func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
@@ -67,15 +69,26 @@ func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
 			ctx.whereColumns = make(map[int64]*tipb.ColumnInfo)
 			collectColumnsInWhere(sel.Where, ctx)
 		}
+		if len(sel.Aggregates) > 0 {
+			// compose aggregateFuncExpr
+			ctx.aggregates = make([]*aggregateFuncExpr, 0, len(sel.Aggregates))
+			for _, agg := range sel.Aggregates {
+				aggExpr := &aggregateFuncExpr{expr: agg}
+				ctx.aggregates = append(ctx.aggregates, aggExpr)
+			}
+		}
 		var rows []*tipb.Row
+		var aggs []*tipb.AggExpr
 		if req.Tp == kv.ReqTypeSelect {
-			rows, err = rs.getRowsFromSelectReq(ctx)
+			rows, aggs, err = rs.getRowsFromSelectReq(ctx)
 		} else {
 			rows, err = rs.getRowsFromIndexReq(txn, sel)
 		}
 		selResp := new(tipb.SelectResponse)
 		selResp.Error = toPBError(err)
 		selResp.Rows = rows
+		selResp.Aggs = aggs
+
 		resp.err = err
 		data, err := proto.Marshal(selResp)
 		if err != nil {
@@ -122,7 +135,7 @@ func collectColumnsInWhere(expr *tipb.Expr, ctx *selectContext) error {
 	return nil
 }
 
-func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, error) {
+func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, []*tipb.AggExpr, error) {
 	kvRanges, desc := rs.extractKVRanges(ctx.sel)
 	var rows []*tipb.Row
 	limit := int64(-1)
@@ -135,12 +148,28 @@ func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, er
 		}
 		ranRows, err := rs.getRowsFromRange(ctx, ran, limit, desc)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, nil, errors.Trace(err)
 		}
-		rows = append(rows, ranRows...)
+		// Do aggregate work here
+		if len(ctx.aggregates) > 0 {
+			log.Debugf("[AGG] handle aggregate")
+			err = rs.aggregate(ctx, ranRows)
+			if err != nil {
+				return nil, nil, errors.Trace(err)
+			}
+		} else {
+			rows = append(rows, ranRows...)
+		}
 		limit -= int64(len(ranRows))
 	}
-	return rows, nil
+	var aggs []*tipb.AggExpr
+	if len(ctx.aggregates) > 0 {
+		aggs = make([]*tipb.AggExpr, 0, len(ctx.aggregates))
+		for _, agg := range ctx.aggregates {
+			aggs = append(aggs, agg.toProto())
+		}
+	}
+	return rows, aggs, nil
 }
 
 // extractKVRanges extracts kv.KeyRanges slice from a SelectRequest, and also returns if it is in descending order.

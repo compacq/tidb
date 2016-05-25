@@ -453,7 +453,7 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 		}
 		pbByItems = append(pbByItems, pbByItem)
 	}
-	fmt.Println("Enable Agg")
+	log.Debug("Use dist aggregate.")
 	// compose aggregate info
 	xSrc.AddAggregate(pbAggFuncs, pbByItems)
 	return src

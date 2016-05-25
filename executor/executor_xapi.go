@@ -172,6 +172,9 @@ func (e *XSelectTableExec) doRequest() error {
 		TableId: proto.Int64(e.table.Meta().ID),
 	}
 	selReq.TableInfo.Columns = tablecodec.ColumnsToProto(columns, e.table.Meta().PKIsHandle)
+	// Aggregate Info
+	selReq.Aggregates = e.aggFuncs
+	selReq.GroupBy = e.byItems
 	e.result, err = xapi.Select(txn.GetClient(), selReq, 1)
 	if err != nil {
 		return errors.Trace(err)

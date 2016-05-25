@@ -19,7 +19,9 @@ It has these top-level messages:
 	ByItem
 	SelectRequest
 	Row
-	AggregateItem
+	AggItem
+	AggGroupEntry
+	AggExpr
 	Error
 	SelectResponse
 */
