@@ -64,8 +64,8 @@ func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
 			sel: sel,
 			txn: txn,
 		}
+		ctx.eval = &xeval.Evaluator{Row: make(map[int64]types.Datum)}
 		if sel.Where != nil {
-			ctx.eval = &xeval.Evaluator{Row: make(map[int64]types.Datum)}
 			ctx.whereColumns = make(map[int64]*tipb.ColumnInfo)
 			collectColumnsInWhere(sel.Where, ctx)
 		}
@@ -77,18 +77,24 @@ func (rs *localRegion) Handle(req *regionRequest) (*regionResponse, error) {
 				ctx.aggregates = append(ctx.aggregates, aggExpr)
 			}
 		}
+
 		var rows []*tipb.Row
-		var aggs []*tipb.AggExpr
 		if req.Tp == kv.ReqTypeSelect {
-			rows, aggs, err = rs.getRowsFromSelectReq(ctx)
+			rows, err = rs.getRowsFromSelectReq(ctx)
 		} else {
 			rows, err = rs.getRowsFromIndexReq(txn, sel)
 		}
+
 		selResp := new(tipb.SelectResponse)
 		selResp.Error = toPBError(err)
 		selResp.Rows = rows
-		selResp.Aggs = aggs
-
+		if len(ctx.aggregates) > 0 {
+			aggs := make([]*tipb.AggExpr, 0, len(ctx.aggregates))
+			for _, agg := range ctx.aggregates {
+				aggs = append(aggs, agg.toProto())
+			}
+			selResp.Aggs = aggs
+		}
 		resp.err = err
 		data, err := proto.Marshal(selResp)
 		if err != nil {
@@ -135,7 +141,7 @@ func collectColumnsInWhere(expr *tipb.Expr, ctx *selectContext) error {
 	return nil
 }
 
-func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, []*tipb.AggExpr, error) {
+func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, error) {
 	kvRanges, desc := rs.extractKVRanges(ctx.sel)
 	var rows []*tipb.Row
 	limit := int64(-1)
@@ -148,28 +154,12 @@ func (rs *localRegion) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, []
 		}
 		ranRows, err := rs.getRowsFromRange(ctx, ran, limit, desc)
 		if err != nil {
-			return nil, nil, errors.Trace(err)
+			return nil, errors.Trace(err)
 		}
-		// Do aggregate work here
-		if len(ctx.aggregates) > 0 {
-			log.Debugf("[AGG] handle aggregate")
-			err = rs.aggregate(ctx, ranRows)
-			if err != nil {
-				return nil, nil, errors.Trace(err)
-			}
-		} else {
-			rows = append(rows, ranRows...)
-		}
+		rows = append(rows, ranRows...)
 		limit -= int64(len(ranRows))
 	}
-	var aggs []*tipb.AggExpr
-	if len(ctx.aggregates) > 0 {
-		aggs = make([]*tipb.AggExpr, 0, len(ctx.aggregates))
-		for _, agg := range ctx.aggregates {
-			aggs = append(aggs, agg.toProto())
-		}
-	}
-	return rows, aggs, nil
+	return rows, nil
 }
 
 // extractKVRanges extracts kv.KeyRanges slice from a SelectRequest, and also returns if it is in descending order.
@@ -326,40 +316,56 @@ func (rs *localRegion) getRowByHandle(ctx *selectContext, handle int64) (*tipb.R
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	rowData := make([][]byte, 0, len(columns))
 	for _, col := range columns {
+		var colVal []byte
 		if *col.PkHandle {
 			if mysql.HasUnsignedFlag(uint(*col.Flag)) {
 				// PK column is Unsigned
 				var ud types.Datum
 				ud.SetUint64(uint64(handle))
-				uHandle, err1 := codec.EncodeValue(nil, ud)
+				var err1 error
+				colVal, err1 = codec.EncodeValue(nil, ud)
 				if err1 != nil {
 					return nil, errors.Trace(err1)
 				}
-				row.Data = append(row.Data, uHandle...)
 			} else {
-				row.Data = append(row.Data, row.Handle...)
+				colVal = row.Handle
 			}
 		} else {
 			colID := col.GetColumnId()
 			if ctx.whereColumns[colID] != nil {
 				// The column is saved in evaluator, use it directly.
 				datum := ctx.eval.Row[colID]
-				row.Data, err = codec.EncodeValue(row.Data, datum)
-				if err != nil {
-					return nil, errors.Trace(err)
+				value := []byte{}
+				var err1 error
+				colVal, err1 = codec.EncodeValue(value, datum)
+				if err1 != nil {
+					return nil, errors.Trace(err1)
 				}
 			} else {
 				key := tablecodec.EncodeColumnKey(tid, handle, colID)
-				data, err1 := ctx.txn.Get(key)
-				if isDefaultNull(err1, col) {
-					row.Data = append(row.Data, codec.NilFlag)
-					continue
-				} else if err1 != nil {
-					return nil, errors.Trace(err1)
+				var err1 error
+				colVal, err1 = ctx.txn.Get(key)
+				if err1 != nil {
+					if !isDefaultNull(err1, col) {
+						return nil, errors.Trace(err1)
+					}
+					colVal = []byte{codec.NilFlag}
 				}
-				row.Data = append(row.Data, data...)
 			}
+		}
+		rowData = append(rowData, colVal)
+	}
+	if len(ctx.aggregates) > 0 {
+		log.Debugf("[AGG] handle aggregate %d", len(rowData))
+		err = rs.aggregate(ctx, rowData)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	} else {
+		for _, d := range rowData {
+			row.Data = append(row.Data, d...)
 		}
 	}
 	return row, nil
